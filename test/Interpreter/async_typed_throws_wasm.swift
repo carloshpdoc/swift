@@ -66,6 +66,60 @@ actor BoomActor {
   }
 }
 
+// For shape q: witness-method x LargeErr.
+protocol LargeAsync {
+  func boom() async throws(LargeErr) -> String
+}
+struct LargeBoom: LargeAsync {
+  func boom() async throws(LargeErr) -> String {
+    throw LargeErr(tag: 11, pad: (0, 0, 0, 0))
+  }
+}
+func invokeLarge<T: LargeAsync>(_ x: T) async -> Result<String, LargeErr> {
+  do { return .success(try await x.boom()) }
+  catch { return .failure(error) }
+}
+
+// For shape r: actor cross-isolation with large typed error.
+actor LargeActor {
+  func bang() async throws(LargeErr) -> String {
+    throw LargeErr(tag: 13, pad: (0, 0, 0, 0))
+  }
+}
+
+// For shape s: @MainActor + async typed-throws with large error.
+@MainActor
+func mainLargeErr() async throws(LargeErr) -> String {
+  throw LargeErr(tag: 17, pad: (0, 0, 0, 0))
+}
+
+// For shape t: replica of stdlib Result.init(catching:) added by
+// PR 88465. None of shapes a-s combines (init) + (nonisolated(nonsending)
+// on both init and body parameter) + (Success: ~Copyable extension) +
+// (@_alwaysEmitIntoClient) + (generic Failure inferred as any Error from
+// untyped-throws closure literal). The SIL band-aid's polymorphic-skip
+// predicate at WasmAsyncT2TLowering.cpp:56-57 (on main) bypasses this
+// t2t shape, which is why stdlib/Result.swift trips on wasi CI under
+// the band-aid but not under the IRGen reorder this branch implements.
+enum MyResult<Success: ~Copyable, Failure: Error>: ~Copyable {
+  case success(Success)
+  case failure(Failure)
+}
+extension MyResult: Copyable where Success: Copyable {}
+
+extension MyResult where Success: ~Copyable {
+  @_alwaysEmitIntoClient
+  nonisolated(nonsending) init(
+    catching body: nonisolated(nonsending) () async throws(Failure) -> Success
+  ) async {
+    do {
+      self = .success(try await body())
+    } catch {
+      self = .failure(error)
+    }
+  }
+}
+
 @main
 struct Main {
   static func main() async {
@@ -190,5 +244,90 @@ struct Main {
     let m = await runIdent { () async -> String in "no-error" }
     print("m-ok: \(m)")
     // CHECK-NEXT: m-ok: no-error
+
+    // n: control-flow-driven captured variable. Cached-context and
+    // cached-error must not be conflated: success path doesn't touch
+    // ind_error; error path uses ind_error. A swap would corrupt one.
+    let capture = Int.random(in: 1...10)
+    let nClosure: () async throws(SmallErr) -> String = {
+      if capture > 0 { return "ok-\(capture)" } else { throw SmallErr.boom }
+    }
+    let nResult = await run(nClosure)
+    switch nResult {
+    case .success(let s): print("n-ok: \(s.hasPrefix("ok-"))")
+    case .failure(let err): print("n-err: \(err)")
+    }
+    // CHECK-NEXT: n-ok: true
+
+    // o: typed throws returning Void —
+    // errorSchema.shouldReturnTypedErrorIndirectly may fire even though
+    // the native result is Void.
+    let oResult: Result<Void, SmallErr> = await run {
+      () async throws(SmallErr) -> Void in throw SmallErr.boom
+    }
+    switch oResult {
+    case .success: print("o-ok")
+    case .failure(let err): print("o-err: \(err)")
+    }
+    // CHECK-NEXT: o-err: boom
+
+    // p: multiple indirect results + typed error.
+    let pResult: Result<(LargeResult, LargeResult), LargeErr> = await run {
+      () async throws(LargeErr) -> (LargeResult, LargeResult) in
+        throw LargeErr(tag: 7, pad: (0, 0, 0, 0))
+    }
+    switch pResult {
+    case .success(let pair): print("p-ok: \(pair.0.tag)")
+    case .failure(let err): print("p-err: tag=\(err.tag)")
+    }
+    // CHECK-NEXT: p-err: tag=7
+
+    // q: witness-method x LargeErr — most complex trailing layout:
+    // Self+WT trailing the [ind_error, swiftself] pair with indirect
+    // typed-error.
+    let qResult = await invokeLarge(LargeBoom())
+    switch qResult {
+    case .success(let s): print("q-ok: \(s)")
+    case .failure(let err): print("q-err: tag=\(err.tag)")
+    }
+    // CHECK-NEXT: q-err: tag=11
+
+    // r: actor cross-isolation — typed-throws async method on a non-Main
+    // actor invoked from a nonisolated context, with a large typed error.
+    // Exercises hop-thunk lowering + new trailing pair.
+    let rResult: Result<String, LargeErr>
+    do { rResult = .success(try await LargeActor().bang()) }
+    catch { rResult = .failure(error) }
+    switch rResult {
+    case .success(let s): print("r-ok: \(s)")
+    case .failure(let err): print("r-err: tag=\(err.tag)")
+    }
+    // CHECK-NEXT: r-err: tag=13
+
+    // s: @MainActor + async typed-throws — main-actor hop with a large
+    // typed error. Verifies the MainActor isolation thunk doesn't
+    // reintroduce a pre-fix layout.
+    let sResult: Result<String, LargeErr>
+    do { sResult = .success(try await mainLargeErr()) }
+    catch { sResult = .failure(error) }
+    switch sResult {
+    case .success(let s): print("s-ok: \(s)")
+    case .failure(let err): print("s-err: tag=\(err.tag)")
+    }
+    // CHECK-NEXT: s-err: tag=17
+
+    // t: PR 88465 Result.init(catching:) replica. Failure is inferred
+    // as `any Error` from the untyped-throws closure literal, which is
+    // the path that triggers stdlib/Result.swift on wasi CI 27957 under
+    // the SIL band-aid still present on main.
+    func asyncThrowing() async throws -> String {
+      throw SmallErr.boom
+    }
+    let t = await MyResult { try await asyncThrowing() }
+    switch t {
+    case .success(let s): print("t-ok: \(s)")
+    case .failure(let e): print("t-err: \(e)")
+    }
+    // CHECK-NEXT: t-err: boom
   }
 }

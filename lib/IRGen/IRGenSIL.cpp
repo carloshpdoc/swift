@@ -1765,6 +1765,18 @@ class AsyncNativeCCEntryPointArgumentEmission final
     : public NativeCCEntryPointArgumentEmission,
       public AsyncEntryPointArgumentEmission {
   llvm::Value *context = nullptr;
+  // Cached trailing pair extracted from allParamValues when the function
+  // signature carries the [ind_error, swiftself] pair (see
+  // hasTrailingAsyncErrorContextPair). Populated in mapAsyncParameters,
+  // read by getCallerTypedErrorResultArgument / getContext.
+  llvm::Value *cachedContextSlot = nullptr;
+  llvm::Value *cachedTypedErrorSlot = nullptr;
+  // For WitnessMethod, the trailing Self/WT come AFTER the
+  // [ind_error, swiftself] pair. They must be pre-extracted before the
+  // pair so collectTrailingWitnessMetadata's takeLast pops match the
+  // base-class consumption order (WT then Self_Metadata).
+  llvm::Value *cachedSelfWitnessTable = nullptr;
+  llvm::Value *cachedSelfMetadata = nullptr;
   /*const*/ AsyncContextLayout layout;
   Address dataAddr;
 
@@ -1790,15 +1802,54 @@ public:
   void mapAsyncParameters() override {
     context = allParamValues.claimNext();
     dataAddr = layout.emitCastTo(IGF, context);
+
+    // Coupled with expandAsyncEntryType layout. Shared gate:
+    // hasTrailingAsyncErrorContextPair. Under the new layout
+    // allParamValues trails with [..., ind_error, swiftself] for
+    // non-witness, or [..., ind_error, swiftself, Self, WT] for
+    // WitnessMethod. Pre-extract Self/WT FIRST so the pair grab below is
+    // unambiguous; cache them for getSelfWitnessTable / getSelfMetadata
+    // so collectTrailingWitnessMetadata receives correct values.
+    auto funcTy = IGF.CurSILFn->getLoweredFunctionType();
+    if (irgen::hasTrailingAsyncErrorContextPair(IGF.IGM, funcTy)) {
+      bool isWitness = funcTy->getRepresentation() ==
+                       SILFunctionTypeRepresentation::WitnessMethod;
+      if (isWitness) {
+        cachedSelfWitnessTable = allParamValues.takeLast();
+        cachedSelfMetadata = allParamValues.takeLast();
+      }
+      cachedContextSlot = allParamValues.takeLast();      // swiftself
+      cachedTypedErrorSlot = allParamValues.takeLast();   // ind_error
+    }
   };
 
   llvm::Value *getCallerErrorResultArgument() override {
     llvm_unreachable("should not be used");
   }
   llvm::Value *getCallerTypedErrorResultArgument() override {
+#ifndef NDEBUG
+    auto funcTy = IGF.CurSILFn->getLoweredFunctionType();
+    if (irgen::hasTrailingAsyncErrorContextPair(IGF.IGM, funcTy) &&
+        !cachedTypedErrorSlot)
+      llvm_unreachable(
+          "predicate drifted: gate matched but cachedTypedErrorSlot empty");
+#endif
+    if (cachedTypedErrorSlot)
+      return cachedTypedErrorSlot;
     return allParamValues.takeLast();
   }
-  llvm::Value *getContext() override { return allParamValues.takeLast(); }
+  llvm::Value *getContext() override {
+#ifndef NDEBUG
+    auto funcTy = IGF.CurSILFn->getLoweredFunctionType();
+    if (irgen::hasTrailingAsyncErrorContextPair(IGF.IGM, funcTy) &&
+        !cachedContextSlot)
+      llvm_unreachable(
+          "predicate drifted: gate matched but cachedContextSlot empty");
+#endif
+    if (cachedContextSlot)
+      return cachedContextSlot;
+    return allParamValues.takeLast();
+  }
   Explosion getArgumentExplosion(unsigned index, unsigned size) override {
     assert(size > 0);
     Explosion result;
@@ -1824,9 +1875,15 @@ public:
     return allParamValues.claimNext();
   };
   llvm::Value *getSelfWitnessTable() override {
+    if (cachedSelfWitnessTable)
+      return cachedSelfWitnessTable;
     return allParamValues.takeLast();
   }
-  llvm::Value *getSelfMetadata() override { return allParamValues.takeLast(); }
+  llvm::Value *getSelfMetadata() override {
+    if (cachedSelfMetadata)
+      return cachedSelfMetadata;
+    return allParamValues.takeLast();
+  }
   llvm::Value *getCoroutineBuffer() override {
     llvm_unreachable(
         "async functions do not use a fixed size coroutine buffer");

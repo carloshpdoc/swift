@@ -2246,28 +2246,63 @@ void SignatureExpansion::expandAsyncReturnType() {
   addErrorResult();
 }
 
-void SignatureExpansion::addIndirectThrowingResult() {
-  if (getSILFuncConventions().funcTy->hasErrorResult() &&
-      getSILFuncConventions().isTypedError()) {
-    auto resultType = getSILFuncConventions().getSILResultType(
-        IGM.getMaximalTypeExpansionContext());
-    auto &ti = IGM.getTypeInfo(resultType);
-    auto &native = ti.nativeReturnValueSchema(IGM);
+/// True when the entry signature for `funcTy` actually carries a trailing
+/// indirect typed-error pointer parameter. Single source of truth for the
+/// result-shape gate consulted both during signature expansion (to emit
+/// the slot) and from consumer sites (to read the slot positionally).
+///
+/// Hot-path note: `nativeReturnValueSchema` walks the type's Clang ABI
+/// calculation. The early returns filter out the common case before any
+/// heavy query runs, so this is bounded for per-emit usage. Memoize
+/// per-CanSILFunctionType if a profile shows it on a tight loop.
+static bool
+hasIndirectTypedErrorResultSlot(IRGenModule &IGM, CanSILFunctionType funcTy) {
+  if (!funcTy->hasErrorResult())
+    return false;
 
-    auto errorType = getSILFuncConventions().getSILErrorType(
-        IGM.getMaximalTypeExpansionContext());
-    const TypeInfo &errorTI = IGM.getTypeInfo(errorType);
-    auto &nativeError = errorTI.nativeReturnValueSchema(IGM);
+  SILFunctionConventions fnConv(funcTy, IGM.getSILModule());
+  if (!fnConv.isTypedError())
+    return false;
 
-    if (getSILFuncConventions().hasIndirectSILResults() ||
-        getSILFuncConventions().hasIndirectSILErrorResults() ||
-        native.requiresIndirect() ||
-        nativeError.shouldReturnTypedErrorIndirectly()) {
-      addOpaquePointerParameter();
-    }
-  }
+  // GenericContextScope is required because consumer-site callers may
+  // invoke this predicate outside an existing scope, and getTypeInfo
+  // crashes on type parameters without one. Nesting is harmless when
+  // called from within an existing scope.
+  GenericContextScope scope(IGM, funcTy->getInvocationGenericSignature());
+  auto resultType =
+      fnConv.getSILResultType(IGM.getMaximalTypeExpansionContext());
+  auto errorType =
+      fnConv.getSILErrorType(IGM.getMaximalTypeExpansionContext());
+  auto &native = IGM.getTypeInfo(resultType).nativeReturnValueSchema(IGM);
+  auto &nativeError = IGM.getTypeInfo(errorType).nativeReturnValueSchema(IGM);
 
+  return fnConv.hasIndirectSILResults() ||
+         fnConv.hasIndirectSILErrorResults() ||
+         native.requiresIndirect() ||
+         nativeError.shouldReturnTypedErrorIndirectly();
 }
+
+void SignatureExpansion::addIndirectThrowingResult() {
+  if (hasIndirectTypedErrorResultSlot(IGM, FnType))
+    addOpaquePointerParameter();
+}
+
+bool irgen::hasTrailingAsyncErrorContextPair(IRGenModule &IGM,
+                                             CanSILFunctionType funcTy) {
+  if (!funcTy->isAsync())
+    return false;
+
+  // The pair only exists when the function carries a trailing
+  // swiftself/context slot to pair with the ind_error slot.
+  bool hasTrailingContext =
+      (funcTy->getRepresentation() == SILFunctionTypeRepresentation::Thick) ||
+      hasSelfContextParameter(funcTy);
+  if (!hasTrailingContext)
+    return false;
+
+  return hasIndirectTypedErrorResultSlot(IGM, funcTy);
+}
+
 void SignatureExpansion::expandAsyncEntryType() {
   ResultIRType = IGM.VoidTy;
 
@@ -2313,6 +2348,18 @@ void SignatureExpansion::expandAsyncEntryType() {
     ParamIRTypes.push_back(IGM.SwiftContextPtrTy);
   }
 
+  // Indirect typed-error pointer is placed BEFORE the swiftself/context
+  // slot so that Thin and Thick async typed-throws signatures agree on
+  // the LLVM-IR position of ind_error. Avoids the wasm END-padding swap
+  // that swapped ind_error and swiftself between Thin and Thick callers.
+  //
+  // Coupled with (must update together if this ordering changes):
+  //   * AsyncCallEmission::setFromCallee
+  //   * AsyncPartialApplicationForwarderEmission
+  //   * AsyncNativeCCEntryPointArgumentEmission::mapAsyncParameters
+  // Shared gate: hasTrailingAsyncErrorContextPair (GenCall.h).
+  addIndirectThrowingResult();
+
   // Context is next.
   if (hasSelfContext) {
     auto curLength = ParamIRTypes.size();
@@ -2353,8 +2400,6 @@ void SignatureExpansion::expandAsyncEntryType() {
       ParamIRTypes.push_back(IGM.RefCountedPtrTy);
     }
   }
-
-  addIndirectThrowingResult();
 
   // For now we continue to store the error result in the context to be able to
   // reuse non throwing functions.
@@ -3217,15 +3262,42 @@ public:
 
     // Add the indirect typed error result if we have one.
     SILFunctionConventions fnConv(fnType, IGF.getSILModule());
+    bool trailingPairHandled = false;
     if (fnType->hasErrorResult() && fnConv.isTypedError()) {
       // The invariant is that this is always zero-initialized, so we
       // don't need to do anything extra here.
       assert(LastArgWritten > 0);
+
+      // Coupled with expandAsyncEntryType layout. Shared gate:
+      // hasTrailingAsyncErrorContextPair. Under the new layout the
+      // trailing pair is [ind_error, swiftself]: ind_error at
+      // LastArgWritten - 2, swiftself at LastArgWritten - 1. We fill
+      // BOTH slots here (and the matching swiftself attribute) so the
+      // regular context-fill below skips when this branch handled it.
+      // Total decrement: 2, matching the OLD layout's combined
+      // error+context decrements; downstream invariants preserved.
+      bool hasTrailingPair =
+          irgen::hasTrailingAsyncErrorContextPair(IGF.IGM, fnType);
+
       // Return the error indirectly.
       if (fnConv.hasIndirectSILErrorResults()) {
-          // We will set the value later when lowering the arguments.
+        // We will set the value later when lowering the arguments.
+        if (hasTrailingPair) {
+          llvm::Value *contextPtr = CurCallee.getSwiftContext();
+          assert(contextPtr &&
+                 "hasTrailingAsyncErrorContextPair implies a context");
+          unsigned ctxIdx = --LastArgWritten;
+          Args[ctxIdx] = contextPtr;
+          IGF.IGM.addSwiftSelfAttributes(CurCallee.getMutableAttributes(),
+                                         ctxIdx);
+          unsigned errorIdx = --LastArgWritten;
+          setIndirectTypedErrorResultSlotArgsIndex(errorIdx);
+          Args[errorIdx] = nullptr;
+          trailingPairHandled = true;
+        } else {
           setIndirectTypedErrorResultSlotArgsIndex(--LastArgWritten);
           Args[LastArgWritten] = nullptr;
+        }
       } else {
         auto silResultTy =
             fnConv.getSILResultType(IGF.IGM.getMaximalTypeExpansionContext());
@@ -3242,14 +3314,28 @@ public:
             fnConv.hasIndirectSILResults()) {
           // Return the error indirectly.
           auto buf = IGF.getCalleeTypedErrorResultSlot(silErrorTy);
-          Args[--LastArgWritten] = buf.getAddress();
+          if (hasTrailingPair) {
+            llvm::Value *contextPtr = CurCallee.getSwiftContext();
+            assert(contextPtr &&
+                   "hasTrailingAsyncErrorContextPair implies a context");
+            unsigned ctxIdx = --LastArgWritten;
+            Args[ctxIdx] = contextPtr;
+            IGF.IGM.addSwiftSelfAttributes(CurCallee.getMutableAttributes(),
+                                           ctxIdx);
+            unsigned errorIdx = --LastArgWritten;
+            Args[errorIdx] = buf.getAddress();
+            trailingPairHandled = true;
+          } else {
+            Args[--LastArgWritten] = buf.getAddress();
+          }
         }
       }
     }
 
     llvm::Value *contextPtr = CurCallee.getSwiftContext();
-    // Add the data pointer if we have one.
-    if (contextPtr) {
+    // Add the data pointer if we have one. Skip when the trailing-pair
+    // branch above already filled it together with ind_error.
+    if (contextPtr && !trailingPairHandled) {
       assert(LastArgWritten > 0);
       Args[--LastArgWritten] = contextPtr;
       IGF.IGM.addSwiftSelfAttributes(CurCallee.getMutableAttributes(),

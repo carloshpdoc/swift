@@ -158,6 +158,18 @@ namespace irgen {
   /// the special treatment for self parameters?
   bool hasSelfContextParameter(CanSILFunctionType fnType);
 
+  /// Returns true if the async-entry signature for this function carries a
+  /// trailing `[ind_error, swiftself]` pair under the layout where
+  /// `addIndirectThrowingResult` is emitted before the swiftself/context
+  /// slot. Used by consumer sites that read these slots positionally
+  /// (caller arg-fill, partial-apply forwarder, native CC entry-point).
+  ///
+  /// Only fires for async typed-throws functions whose result/error shape
+  /// requires the indirect-error pointer AND that carry a trailing
+  /// swiftself/context slot (Thick or self-context).
+  bool hasTrailingAsyncErrorContextPair(IRGenModule &IGM,
+                                        CanSILFunctionType funcTy);
+
   /// Add function attributes to an attribute set for a byval argument.
   void addByvalArgumentAttributes(IRGenModule &IGM,
                                   llvm::AttributeList &attrs,
